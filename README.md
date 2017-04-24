@@ -1,3 +1,5 @@
+> Note: This repo has moved to [F1LT3R/markserv](https://github.com/F1LT3R/markserv).
+
 # markserv
 
 `markserv` serves Markdown files as GitHub style HTML and LiveReloads your changes in the browser as you edit.
