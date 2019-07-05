@@ -52,6 +52,8 @@ const connectLiveReload = require('connect-livereload')
 const ansi = require('ansi')
 const io = require('socket.io')()
 const lunr = require('lunr')
+const cheerio = require('cheerio')
+
 const find = require('./find')
 
 const cursor = ansi(process.stdout)
@@ -103,13 +105,6 @@ const errormsg = type => cursor
   .fg.red()
   .write(' ')
 
-const clients = {}
-
-io.on('connection', client => {
-  console.log(client.id)
-})
-io.listen(34567)
-
 // hasMarkdownExtension: check whether a file is Markdown type
 const hasMarkdownExtension = path => {
   const fileExtension = path.substr(path.length - 3).toLowerCase()
@@ -123,82 +118,6 @@ const hasMarkdownExtension = path => {
 
   return extensionMatch
 }
-
-// getFile: reads utf8 content from a file
-const getFile = path => new Promise((resolve, reject) => {
-  fs.readFile(path, 'utf8', (err, data) => {
-    if (err) {
-      return reject(err)
-    }
-    resolve(data)
-  })
-})
-
-let searchIndex
-
-const loadAllSearchFiles = fileList => new Promise((resolve, reject) => {
-  const promises = []
-
-  fileList.forEach(filepath => {
-    promises.push(getFile(filepath))
-  })
-
-  Promise.all(promises).then(contents => {
-    const documents = []
-
-    // console.log(contents)
-
-    contents.forEach((fileContent, idx) => {
-      const fileName = fileList[idx]
-      documents.push({
-        id: fileName,
-        title: fileName,
-        body: fileContent
-      })
-    })
-
-    searchIndex = lunr(function () {
-      this.ref('id')
-      this.field('title')
-      this.field('body')
-
-      documents.forEach(function (document) {
-        this.add(document)
-      }, this)
-    })
-    // console.log(searchIndex)
-
-    const searchResults = searchIndex.search('LiveReload')
-    console.log(searchResults)
-
-    resolve(searchIndex)
-  }).catch(err => {
-    reject(err)
-  })
-})
-
-const setupSearchFeature = () => new Promise((resolve, reject) => {
-  const rootPath = dir
-  const filePattern = './**/*.md'
-
-  find(rootPath, filePattern)
-  .then(loadAllSearchFiles)
-  .catch(err => {
-    reject(err)
-  })
-})
-
-setupSearchFeature()
-
-// Get Custom Less CSS to use in all Markdown files
-const buildStyleSheet = cssPath =>
-  new Promise(resolve =>
-    getFile(cssPath).then(data =>
-      less.render(data).then(data =>
-        resolve(data.css)
-      )
-    )
-  )
 
 // markdownToHTML: turns a Markdown file into HTML content
 const markdownToHTML = markdownText => new Promise((resolve, reject) => {
@@ -215,6 +134,208 @@ const markdownToHTML = markdownText => new Promise((resolve, reject) => {
 
   resolve(result)
 })
+
+const separators = [
+  ' ',
+  '-',
+  '-'
+].join('|')
+
+const highlight = (tokens, content) => {
+  let hlResult = ''
+  const foundTokens = {}
+  const contentLower = content.toLowerCase()
+
+  tokens.forEach(token => {
+    if (token.length < 1) {
+      return
+    }
+
+    const foundIdx = contentLower.indexOf(token)
+    const found = foundIdx > -1
+
+    if (found) {
+      foundTokens[token] = true
+    }
+  })
+
+  if (Reflect.ownKeys(foundTokens).length >= 0) {
+    const hlLine = content.replace(
+      new RegExp(tokens.join('|'), 'gi'), str => {
+        return `<span class="highlight">${str}</span>`
+      }
+    )
+
+    // Only add the highlighted lines
+    if (hlLine !== content) {
+      hlResult = hlLine
+    }
+  }
+  // console.log(hlResult)
+
+  return hlResult
+}
+
+const mdToHtmlHighlighted = (tokens, mdContent) => {
+  const reader = new commonmark.Parser()
+  const writer = new commonmark.HtmlRenderer()
+  const parsed = reader.parse(mdContent)
+  const html = writer.render(parsed)
+
+  const found = []
+
+  const filter = (node, tokens) => {
+    if (node.type === 'text') {
+      const text = node.data
+      const hlText = highlight(tokens, text)
+      const parentNode = cheerio.load(node.parent)
+      const tagName = node.parent.name
+      if (hlText.length > 0 && tagName !== null) {
+        const $tag = cheerio.load(parentNode.html())
+        $tag(tagName).empty().prepend(hlText)
+        const elemHtml = $tag(tagName).parent().html()
+        found.push(elemHtml)
+      }
+    }
+
+    if (Reflect.has(node, 'children')) {
+      node.children.forEach(child => {
+        filter(child, tokens)
+      })
+    }
+  }
+
+  const $ = cheerio.load(html)._root
+  filter($, tokens)
+  const result = found.join('\n')
+  return result
+}
+
+// getFile: reads utf8 content from a file
+const getFile = path => new Promise((resolve, reject) => {
+  fs.readFile(path, 'utf8', (err, data) => {
+    if (err) {
+      return reject(err)
+    }
+    resolve(data)
+  })
+})
+
+let searchIndex
+const loadedMarkdownFiles = {}
+
+const loadAllSearchFiles = fileList => new Promise((resolve, reject) => {
+  const promises = []
+
+  fileList.forEach(filepath => {
+    promises.push(getFile(filepath))
+  })
+
+  Promise.all(promises).then(contents => {
+    // console.log(contents)
+
+    const documents = []
+
+    contents.forEach((fileContent, idx) => {
+      const fileName = fileList[idx]
+      const title = path.basename(fileName)
+      const href = fileName
+
+      const documentObject = {
+        id: fileName,
+        title,
+        href,
+        body: fileContent,
+        bodyHl: ''
+      }
+
+      documents.push(documentObject)
+      loadedMarkdownFiles[fileName] = documentObject
+    })
+
+    searchIndex = lunr(function () {
+      this.ref('id')
+      this.field('title')
+      this.field('body')
+
+      documents.forEach(function (document) {
+        this.add(document)
+      }, this)
+    })
+    // console.log(searchIndex)
+
+    resolve(searchIndex)
+  }).catch(err => {
+    reject(err)
+  })
+})
+
+const clients = {}
+
+io.on('connection', client => {
+  console.log(client.id)
+  clients[client.id] = client
+
+  client.on('search', term => {
+    if (typeof searchIndex !== 'object') {
+      client.emit('search_results', false)
+      return
+    }
+
+    if (term.length < 2) {
+      return
+    }
+
+    console.log(`searching for: ${term}`)
+    const lunrSearchResults = searchIndex.search(term)
+
+    lunrSearchResults.map(result => {
+      const tokenList = term.toLowerCase().split(new RegExp(separators, 'g'))
+      const tokens = []
+      tokenList.forEach(token => {
+        if (token.length > 2) {
+          tokens.push(token)
+        }
+      })
+
+      const fileName = result.ref
+      const mdContent = loadedMarkdownFiles[fileName].body
+
+      const hlHtml = mdToHtmlHighlighted(tokens, mdContent)
+      result.content = loadedMarkdownFiles[fileName]
+      result.content.hl = hlHtml
+      return result
+    })
+
+    client.emit('search_results', lunrSearchResults)
+  })
+})
+
+io.listen(34567)
+
+const setupSearchFeature = () => new Promise((resolve, reject) => {
+  const rootPath = dir
+  const filePattern = './**/*.md'
+
+  find(rootPath, filePattern)
+  .then(loadAllSearchFiles)
+  .catch(err => {
+    console.err(err)
+    reject(err)
+  })
+})
+
+setupSearchFeature()
+
+// Get Custom Less CSS to use in all Markdown files
+const buildStyleSheet = cssPath =>
+  new Promise(resolve =>
+    getFile(cssPath).then(data =>
+      less.render(data).then(data =>
+        resolve(data.css)
+      )
+    )
+  )
 
 // linkify: converts github style wiki markdown links to .md links
 const linkify = body => new Promise((resolve, reject) => {
@@ -248,7 +369,6 @@ const linkify = body => new Promise((resolve, reject) => {
     }
 
     const html = window.document.getElementsByTagName('body')[0].innerHTML
-
     resolve(html)
   })
 })
@@ -361,7 +481,7 @@ const buildHTMLFromMarkDown = markdownPath => new Promise(resolve => {
             <div class="container">
               ${(header ? '<header>' + header + '</header>' : '')}
               ${(navigation ? '<nav>' + navigation + '</nav>' : '')}
-              ${(flags.searchbar ? '<div id="search-bar">' + searchbarTemplate + '</div>' : '')}
+              ${(flags.searchbar ? searchbarTemplate : '')}
               <article>${htmlBody}</article>
               ${(footer ? '<footer>' + footer + '</footer>' : '')}
             </div>
